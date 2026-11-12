@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-trace.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1142,6 +1143,21 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
     }
 }
 
+void llama_context::set_decode_batch_callback(llama_decode_batch_callback callback, void * callback_data) {
+    LLAMA_LOG_DEBUG("%s: call\n", __func__);
+
+    this->decode_batch_callback = callback;
+    this->decode_batch_callback_data = callback_data;
+}
+
+bool llama_context::sync_decode_batch(llama_batch & batch) {
+    if (decode_batch_callback == nullptr) {
+        return true;
+    }
+
+    return decode_batch_callback(this, &batch, decode_batch_callback_data);
+}
+
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1690,10 +1706,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// scopes all traced allreduce / ring traffic to a single decode call
+struct llama_trace_step {
+    llama_trace_step(int n_tokens) { ggml_trace_step_begin("decode", n_tokens); }
+    ~llama_trace_step() { ggml_trace_step_end(); }
+};
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    llama_trace_step trace_step(batch_inp.n_tokens);
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -3661,6 +3685,10 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }
 
+void llama_set_decode_batch_callback(llama_context * ctx, llama_decode_batch_callback callback, void * user_data) {
+    ctx->set_decode_batch_callback(callback, user_data);
+}
+
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
@@ -4074,6 +4102,11 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
+    if (!ctx->sync_decode_batch(batch)) {
+        LLAMA_LOG_ERROR("%s: failed to synchronize decode batch, client might exit\n", __func__);
+        return -1;
+    }
+
     const int ret = ctx->decode(batch);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);

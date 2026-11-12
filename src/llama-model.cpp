@@ -339,23 +339,124 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
-struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
-    const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+#include <atomic>
+
+// dist-tp attention split by query heads, head map per layer: 0 = layer split by whole KV groups,
+// else 1 + q_off + (n_gqa << 16). Filled while the split states are computed (model load).
+static std::atomic<int32_t> g_dist_attn_headmap[4096];
+
+static void llama_dist_attn_headmap_set(uint32_t il, int32_t q_off, int32_t n_gqa) {
+    GGML_ASSERT(il < 4096 && q_off >= 0 && q_off < 256 && n_gqa > 0 && n_gqa < 256);
+    g_dist_attn_headmap[il].store(1 + q_off + (n_gqa << 16));
+}
+
+bool llama_dist_attn_headmap(int il, int32_t * q_off, int32_t * n_gqa) {
+    if (il < 0 || il >= 4096) {
+        return false;
+    }
+    const int32_t v = g_dist_attn_headmap[il].load();
+    if (v == 0) {
+        return false;
+    }
+    *q_off = (v - 1) & 0xFFFF;
+    *n_gqa = (v - 1) >> 16;
+    return true;
+}
+
+static ggml_backend_meta_split_state llama_meta_device_get_split_state_impl(
+        const struct ggml_tensor * tensor,
+        const llama_meta_device_get_split_state_userdata * ud,
+        struct llama_tensor_shard_view * shard_view) {
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
 
-    static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
-    static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
-    static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
-    static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
-    static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
-    static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
-    static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
-    static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
-    static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
-    static const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
-    static const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    if (shard_view != nullptr) {
+        *shard_view = {};
+    }
+
+    // dist-tp: split the query heads of an attention layer by heads instead of whole KV groups when its KV heads do
+    // not divide by the rank count (Qwen3-235B, 4 KV heads on 3 ranks: 16/16/32 query heads by whole groups,
+    // 20/22/22 by heads). Each rank keeps every KV head its query heads use, so a KV head on a boundary is projected
+    // and cached on both ranks; the FA op carries the head map (ggml_flash_attn_ext_set_head_map, set in
+    // llm_graph_context::build_attn_mha). Used only where, on every rank, the query heads divide by the KV heads,
+    // there are no more KV heads and fewer query heads than the busiest rank has by whole groups, and only when the
+    // device runs the head map.
+    //
+    // query granularity of a layer split by heads in elements, from the block size of attn_output as for whole groups
+    auto attn_rebalance_granularity = [&](uint32_t il, int64_t blck_size) -> int64_t {
+        const int64_t head_dim = hparams.n_embd_head_k(il);
+        int64_t blck_size_perf = blck_size;
+        while (blck_size_perf < 128 && blck_size_perf*(int64_t) ud->n_devices < (int64_t) hparams.n_gqa(il)*head_dim) {
+            blck_size_perf *= 2;
+        }
+        return std::lcm(head_dim, blck_size_perf);
+    };
+    // query heads [qlo, qhi) and KV heads [klo, khi) of a rank when layer il is split by query heads
+    auto attn_head_split = [&](uint32_t il, int rank, int64_t & qlo, int64_t & qhi, int64_t & klo, int64_t & khi) {
+        const ggml_tensor * wo = ud->model->get_tensor(("blk." + std::to_string(il) + ".attn_output.weight").c_str());
+        GGML_ASSERT(wo != nullptr);
+        const int64_t head_dim = hparams.n_embd_head_k(il);
+        const int64_t n_gqa    = hparams.n_gqa(il);
+        ggml_backend_meta_dist_split_bounds(head_dim*hparams.n_head(il), attn_rebalance_granularity(il, ggml_blck_size(wo->type)),
+            rank, ud->dist_tp_world_size, &qlo, &qhi);
+        GGML_ASSERT(qlo % head_dim == 0 && qhi % head_dim == 0);
+        qlo /= head_dim;
+        qhi /= head_dim;
+        klo = qlo / n_gqa;
+        khi = (qhi + n_gqa - 1) / n_gqa;
+    };
+    auto attn_rebalance = [&](uint32_t il) -> bool {
+        if (!ud->fa_head_map || ud->dist_tp_world_size <= 1 || ud->n_devices != 1 || il >= hparams.n_layer() ||
+                hparams.is_recr(il) || hparams.n_gqa(il) <= 1 || hparams.n_embd_k_gqa(il) != hparams.n_embd_v_gqa(il) ||
+                hparams.n_head_kv(il) % ud->dist_tp_world_size == 0 ||
+                ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+            return false;
+        }
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        const ggml_tensor * q_norm = ud->model->get_tensor((prefix + "attn_q_norm.weight").c_str());
+        if (ud->model->get_tensor((prefix + "attn_q.weight").c_str())      == nullptr ||
+            ud->model->get_tensor((prefix + "attn_output.weight").c_str()) == nullptr ||
+            (q_norm != nullptr && q_norm->ne[1] != 1)) {
+            return false;
+        }
+        // KV heads of the busiest rank by whole groups
+        const int64_t kv_max = (hparams.n_head_kv(il) + ud->dist_tp_world_size - 1) / ud->dist_tp_world_size;
+        for (int r = 0; r < ud->dist_tp_world_size; ++r) {
+            int64_t qlo = 0, qhi = 0, klo = 0, khi = 0;
+            attn_head_split(il, r, qlo, qhi, klo, khi);
+            if (qhi <= qlo || (qhi - qlo) % (khi - klo) != 0 || khi - klo > kv_max ||
+                    qhi - qlo >= kv_max*(int64_t) hparams.n_gqa(il)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // this rank's query and KV heads of a layer split by query heads; records the head map
+    auto attn_rebalance_heads = [&](uint32_t il, int64_t & qlo, int64_t & qhi, int64_t & klo, int64_t & khi) {
+        const int64_t n_gqa = hparams.n_gqa(il);
+        const int     rank  = std::max(0, std::min(ud->dist_tp_rank, ud->dist_tp_world_size - 1));
+        attn_head_split(il, rank, qlo, qhi, klo, khi);
+        llama_dist_attn_headmap_set(il, (int32_t) (qlo - klo*n_gqa), (int32_t) n_gqa);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            LLAMA_LOG_INFO("llama_meta_device_get_split_state: dist-tp attention split by query heads: rank %d of %d, "
+                "layer %u: query heads %lld..%lld, KV heads %lld..%lld, q_off %lld\n", rank, ud->dist_tp_world_size, il,
+                (long long) qlo, (long long) qhi - 1, (long long) klo, (long long) khi - 1, (long long) (qlo - klo*n_gqa));
+        }
+    };
+
+    const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
+    const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
+    const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
+    const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
+    const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
+    const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
+    const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
+    const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
+    const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
+    const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
     static const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     static const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -405,21 +506,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         uint32_t il;
         std::string prefix;
         size_t rotation;
+        const size_t rank_rotation = (ud->dist_tp_world_size > 1 && ud->n_devices > 0)
+            ? ((size_t) ((ud->dist_tp_rank % (int) ud->n_devices + (int) ud->n_devices) % (int) ud->n_devices))
+            : 0;
         if (tensor_name.substr(0, 4) == "blk.") {
             const size_t length_prefix = tensor_name.find('.', 4);
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = (get_il_eff(il) + rank_rotation) % ud->n_devices;
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = (get_il_eff(il) + rank_rotation) % ud->n_devices;
         } else {
             il = 0;
-            rotation = hparams.n_layer() % ud->n_devices;
+            rotation = (hparams.n_layer() + rank_rotation) % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
         if (tensor_axis_0 == nullptr) {
@@ -431,6 +535,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // dist-tp: keep the gated DeltaNet (linear attention) layers of Qwen3-Next whole on every rank. The
+        // DeltaNet graph reshapes their tensors, which the meta backend allows for one segment only
+        // (handle_reshape: GGML_ASSERT(src_ss[0].n_segments == 1)), and Qwen3-Next's qkv has two. Mirrored,
+        // the block runs on every rank with no collective; full attention, the FFN and the output still
+        // split. Qwen3.5's DeltaNet tensors repeat one segment, and split (see below).
+        if (ud->dist_tp_world_size > 1 && ud->n_devices == 1 && ud->model->arch == LLM_ARCH_QWEN3NEXT &&
+                (std::regex_match(tensor_name, pattern_qkv_weight)     || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                 std::regex_match(tensor_name, pattern_ssm_dt)         || std::regex_match(tensor_name, pattern_ssm_a)            ||
+                 std::regex_match(tensor_name, pattern_ssm_alpha)      || std::regex_match(tensor_name, pattern_ssm_beta)         ||
+                 std::regex_match(tensor_name, pattern_ssm_beta_alpha) || std::regex_match(tensor_name, pattern_ssm_conv1d)       ||
+                 std::regex_match(tensor_name, pattern_ssm_out_weight) ||
+                 std::regex_match(tensor_name, pattern_r_cache)        || std::regex_match(tensor_name, pattern_s_cache))) {
+            const tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (hparams.is_recr(tc.il)) {
+                return tc;
+            }
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
@@ -621,7 +743,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {std::lcm(n_embd_q, blck_size_perf)/n_embd_q * n_gqa};
             }
 
-            const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
+            const int64_t granularity_q = attn_rebalance(il) ? attn_rebalance_granularity(il, blck_size) : std::lcm(n_embd_q, blck_size_perf);
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
@@ -649,8 +771,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_up_bias) ||
-                std::regex_match(tensor_name, pattern_ffn_gate_weight) || std::regex_match(tensor_name, pattern_ffn_gate_bias) ||
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) || std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
@@ -679,32 +800,186 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
-        for (size_t is = 0; is < segments.size(); is++) {
-            const int64_t  ne_s = segments[is].first;
-            const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
+        const bool dist_single_device = ud->n_devices == 1 && ud->dist_tp_world_size > 1;
+        const int rank = std::max(0, std::min(ud->dist_tp_rank, ud->dist_tp_world_size - 1));
+        const int world_size = std::max(1, ud->dist_tp_world_size);
+        size_t dist_expanded_segments = 0;
+        if (dist_single_device) {
+            for (const auto & seg : segments) {
+                dist_expanded_segments += seg.second;
+            }
+            GGML_ASSERT(dist_expanded_segments <= 16);
+        }
+
+        if (dist_single_device && shard_view != nullptr) {
+            shard_view->compact = split_state.axis >= 0 && split_state.axis <= GGML_BACKEND_SPLIT_AXIS_3;
+            shard_view->axis = split_state.axis;
+            shard_view->n_segments = dist_expanded_segments;
+        }
+
+        if (dist_single_device && segments.size() == 1) {
+            const int64_t ne_s = segments[0].first;
+            const uint32_t nr_s = segments[0].second;
+            const int64_t g_s = granularity[0];
+
+            int64_t low = ne_s * rank / world_size;
+            int64_t high = ne_s * (rank + 1) / world_size;
+
+            if (g_s > 1) {
+                low -= low % g_s;
+                if (rank == world_size - 1) {
+                    high = ne_s;
+                } else {
                     high -= high % g_s;
                 }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
+                if (high < low) {
+                    high = low;
+                }
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
-            split_state.nr[is] = nr_s;
+
+            if (nr_s == 1 && attn_rebalance(tc.il)) {
+                const bool is_q     = std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias) ||
+                                      std::regex_match(tensor_name, pattern_attn_out_weight);
+                const bool is_kv    = std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_bias) ||
+                                      std::regex_match(tensor_name, pattern_kv_cache);
+                const bool is_sinks = std::regex_match(tensor_name, pattern_attn_sinks);
+                if (is_q || is_kv || is_sinks) {
+                    int64_t qlo = 0, qhi = 0, klo = 0, khi = 0;
+                    attn_rebalance_heads(tc.il, qlo, qhi, klo, khi);
+                    if (is_q) {
+                        // already split by heads above; the KV bounds and the head map assume exactly these
+                        const int64_t head_dim = hparams.n_embd_head_k(tc.il);
+                        GGML_ASSERT(low == qlo*head_dim && high == qhi*head_dim);
+                    } else if (is_sinks) {
+                        GGML_ASSERT(ne_s == (int64_t) hparams.n_head(tc.il));
+                        low  = qlo;
+                        high = qhi;
+                    } else {
+                        const int64_t n_head_kv = hparams.n_head_kv(tc.il);
+                        GGML_ASSERT(ne_s % n_head_kv == 0);
+                        low  = klo * (ne_s / n_head_kv);
+                        high = khi * (ne_s / n_head_kv);
+                    }
+                }
+            }
+
+            const int64_t local = high - low;
+            int64_t segment_base = 0;
+            for (uint32_t r = 0; r < nr_s; ++r) {
+                split_state.ne[r] = local;
+                split_state.nr[r] = 1;
+                if (shard_view != nullptr) {
+                    shard_view->segment_starts[r] = segment_base + low;
+                    shard_view->segment_lengths[r] = local;
+                }
+                segment_base += ne_s;
+            }
+            if (shard_view != nullptr) {
+                shard_view->n_segments = nr_s;
+            }
+            if (nr_s > 1) {
+                // upstream's form: one segment of `local` elements, repeated nr_s times (Qwen3.5's DeltaNet
+                // tensors). The meta backend reshapes and views it like a multi-GPU split; the loader still
+                // reads the nr_s slices above.
+                for (uint32_t r = 0; r < nr_s; ++r) {
+                    split_state.ne[r] = 0;
+                    split_state.nr[r] = 0;
+                }
+                split_state.ne[0] = local;
+                split_state.nr[0] = nr_s;
+                split_state.n_segments = 1;
+            } else if (local > 0) {
+                split_state.n_segments = nr_s;
+            } else {
+                // Tiny tensors can legitimately be empty on a rank after granularity rounding.
+                for (uint32_t r = 0; r < nr_s; ++r) {
+                    split_state.ne[r] = 0;
+                    split_state.nr[r] = 1;
+                }
+                split_state.n_segments = nr_s;
+            }
+        } else if (dist_single_device && segments.size() > 1) {
+            int64_t segment_base = 0;
+            size_t out_is = 0;
+            for (size_t is = 0; is < segments.size(); ++is) {
+                const int64_t ne_s = segments[is].first;
+                const uint32_t nr_s = segments[is].second;
+                const int64_t g_s = granularity[is];
+
+                int64_t low = ne_s * rank / world_size;
+                int64_t high = ne_s * (rank + 1) / world_size;
+
+                if (g_s > 1) {
+                    low -= low % g_s;
+                    if (rank == world_size - 1) {
+                        high = ne_s;
+                    } else {
+                        high -= high % g_s;
+                    }
+                    if (high < low) {
+                        high = low;
+                    }
+                }
+
+                const int64_t local = high - low;
+                for (uint32_t r = 0; r < nr_s; ++r) {
+                    split_state.ne[out_is] = local;
+                    split_state.nr[out_is] = 1;
+                    if (shard_view != nullptr) {
+                        shard_view->segment_starts[out_is] = segment_base + low;
+                        shard_view->segment_lengths[out_is] = local;
+                    }
+                    segment_base += ne_s;
+                    out_is++;
+                }
+            }
+            split_state.n_segments = out_is;
+        } else {
+            for (size_t is = 0; is < segments.size(); is++) {
+                const int64_t ne_s = segments[is].first;
+                const uint32_t nr_s = segments[is].second;
+                const int64_t g_s = granularity[is];
+                int64_t low = 0;
+                size_t j = 0;
+                for (; j < ud->n_devices - 1; j++) {
+                    int64_t high = tensor_split_scan.back() == 0.0f ?
+                        ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
+                    if (high % g_s != 0) {
+                        high -= high % g_s;
+                    }
+                    split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
+                    low = high;
+                }
+                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
+                split_state.nr[is] = nr_s;
+            }
+            split_state.n_segments = segments.size();
         }
-        split_state.n_segments = segments.size();
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
     }
     return split_state;
-    GGML_UNUSED(userdata);
+}
+
+struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
+    const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    return llama_meta_device_get_split_state_impl(tensor, ud, nullptr);
+}
+
+bool llama_meta_device_get_tensor_shard_view(const struct ggml_tensor * tensor, void * userdata, struct llama_tensor_shard_view * out) {
+    GGML_ASSERT(out != nullptr);
+    const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
+    const ggml_backend_meta_split_state split_state = llama_meta_device_get_split_state_impl(tensor, ud, out);
+    if (!out->compact) {
+        return false;
+    }
+    if (split_state.axis < 0 || split_state.axis > GGML_BACKEND_SPLIT_AXIS_3) {
+        *out = {};
+        return false;
+    }
+    return true;
 }
 
 const char * llm_type_name(llm_type type) {
@@ -1983,6 +2258,25 @@ static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t d
     bool op_supported = ggml_backend_dev_supports_op(dev, op_tensor);
 
     return op_supported;
+}
+
+bool llama_devs_support_fa_head_map(ggml_backend_dev_t * devs, size_t n_devs) {
+    // a flash attention op of a shard: 2 query heads on 1 KV head, with a head map
+    auto fn = [](ggml_context * ctx) {
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128,   1, 2, 1);
+        ggml_tensor * k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, 256, 1, 1);
+        ggml_tensor * v  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, 256, 1, 1);
+        ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, nullptr, 1.0f, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_head_map(fa, 1, 2);
+        return fa;
+    };
+    for (size_t i = 0; i < n_devs; ++i) {
+        if (!buft_supported(ggml_backend_dev_buffer_type(devs[i]), devs[i], fn)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 template<typename F>

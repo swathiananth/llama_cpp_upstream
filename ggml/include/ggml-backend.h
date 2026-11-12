@@ -396,11 +396,32 @@ extern "C" {
     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
     typedef struct ggml_backend_meta_split_state(*ggml_backend_meta_get_split_state_t)(const struct ggml_tensor * tensor, void * userdata);
 
+    struct ggml_backend_meta_dist_cfg {
+        int32_t world_rank;
+        int32_t world_size;
+    };
+
     // create a new meta device from "simple" devices, meta buffer type/buffer/backend is then derived from this:
     // TODO: this looks a bit strange - a backend API creates a device. I think we should try
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
-        ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+        ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud,
+        const struct ggml_backend_meta_dist_cfg * dist_cfg);
+
+    // optional process-level cross-rank exchange hook for meta backend subgraph boundary reductions
+    // meta backend orchestrates accumulation and only requests raw payload exchange.
+    typedef bool (*ggml_backend_meta_dist_allreduce_tensor_t)(void * comm_ctx, const float * send_data, size_t n,
+                                                              int32_t src_rank, float * recv_data, int32_t * recv_src_rank);
+    GGML_API void ggml_backend_meta_set_dist_allreduce(void * comm_ctx, ggml_backend_meta_dist_allreduce_tensor_t allreduce);
+    GGML_API void ggml_backend_meta_get_dist_allreduce(void ** comm_ctx, ggml_backend_meta_dist_allreduce_tensor_t * allreduce);
+
+    // the slice [*low, *high) of an axis of n elements that dist-TP rank `rank` of `world_size` holds: an equal
+    // share cut at multiples of `granularity`, the last rank taking the rest. the meta backend splits the same way.
+    GGML_API void ggml_backend_meta_dist_split_bounds(int64_t n, int64_t granularity, int rank, int world_size, int64_t * low, int64_t * high);
+
+    // the number of floats the boundary all-reduce of n values hands to the exchange hook: n / 2 + 1 with the
+    // default f16 wire (n even), n with LLAMA_DIST_TP_WIRE_F32=1. lets dist-TP size its transport for one token.
+    GGML_API size_t ggml_backend_meta_dist_wire_floats(size_t n);
 
     //
     // Utils

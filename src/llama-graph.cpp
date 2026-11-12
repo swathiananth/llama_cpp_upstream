@@ -2439,6 +2439,15 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
 
+        // dist-tp attention split by query heads: which local KV head each local query head uses
+        {
+            int32_t hm_off = 0;
+            int32_t hm_gqa = 0;
+            if (llama_dist_attn_headmap(il, &hm_off, &hm_gqa)) {
+                ggml_flash_attn_ext_set_head_map(cur, hm_off, hm_gqa);
+            }
+        }
+
         if (v_mla) {
 #if 0
             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
@@ -2458,6 +2467,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
+        {
+            int32_t hm_off = 0;
+            int32_t hm_gqa = 0;
+            if (llama_dist_attn_headmap(il, &hm_off, &hm_gqa)) {
+                GGML_ABORT("the dist-tp attention split by query heads needs flash attention (-fa on)");
+            }
+        }
+
         ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
         cb(kq, "kq", il);
 

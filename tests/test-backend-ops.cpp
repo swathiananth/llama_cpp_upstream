@@ -6914,6 +6914,76 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a head map: the query heads of one tensor-parallel shard, which can
+// start and end inside a KV group (ggml_flash_attn_ext_set_head_map)
+struct test_flash_attn_ext_head_map : public test_case {
+    const int64_t nh;    // query heads of the shard
+    const int64_t nh_kv; // KV heads the shard holds
+    const int32_t q_off; // position of the first query head in the first KV group
+    const int32_t n_gqa; // query heads per KV group of the whole model
+    const int64_t kv;    // kv size
+    const int64_t nb;    // batch size
+    const bool sinks;
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR8(nh, nh_kv, q_off, n_gqa, kv, nb, sinks, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_head_map(int64_t nh = 22, int64_t nh_kv = 2, int32_t q_off = 4, int32_t n_gqa = 16,
+                                 int64_t kv = 1000, int64_t nb = 1, bool sinks = false, ggml_type type_KV = GGML_TYPE_Q8_0)
+        : nh(nh), nh_kv(nh_kv), q_off(q_off), n_gqa(n_gqa), kv(kv), nb(nb), sinks(sinks), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs = 128;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh, 1);
+        ggml_set_name(q, "q");
+
+        // views of a larger cache, as in the model
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hs, 2*kv, nh_kv, 1);
+        ggml_tensor * k  = ggml_view_4d(ctx, k0, hs, kv, nh_kv, 1, k0->nb[1], k0->nb[2], k0->nb[3], 0);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hs, 2*kv, nh_kv, 1);
+        ggml_tensor * v  = ggml_view_4d(ctx, v0, hs, kv, nh_kv, 1, v0->nb[1], v0->nb[2], v0->nb[3], 0);
+        ggml_set_name(v, "v");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+            ggml_set_name(s, "s");
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks   (out, s);
+        ggml_flash_attn_ext_set_prec    (out, GGML_PREC_F32);
+        ggml_flash_attn_ext_set_head_map(out, q_off, n_gqa);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9039,6 +9109,52 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen3-235B-A22B Q2_K decode shapes at 2 and 3 ranks, for the Intel Xe2/Xe3 matvec kernels:
+    // k of 512/768 gives an odd block count, 1003 rows a partial workgroup
+    for (ggml_type type_a : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int64_t k : {512, 768, 2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 1, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1003, n, 768, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, true, 768, 1, 4096));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, true, 1003, 1, 4096));
+        for (int64_t k : {512, 768}) {
+            test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, GGML_TYPE_F32, 128, 8, false, 4096, 1, k, 1, true));
+        }
+    }
+
+    // and its single-token flash attention: 2 kv heads of 16 q heads each, so the 16 q heads of a
+    // kv head can share one workgroup; kv 1000 is not a multiple of any block size
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t kv : {256, 1000, 1024, 2048}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_type, kv_type));
+        }
+    }
+    // the Intel decode kernel's other paths on that shape: 1 and 4 kv heads (3 and 1 nodes), sinks,
+    // no mask, a second sequence, fewer positions than one chunk, and the K/V cache's own layout
+    // (positions of all kv heads interleaved)
+    for (int64_t nh : {1, 4}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, nh, {16, 1}, 1000, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    }
+    // a shard's query heads split inside KV groups: the three shards of 64 query heads and 4 KV
+    // heads on three ranks (20, 22 and 22 query heads), for one token and for a batch
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int64_t nb : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext_head_map(20, 2,  0, 16, 1000, nb, false, kv_type));
+            test_cases.emplace_back(new test_flash_attn_ext_head_map(22, 2,  4, 16, 1000, nb, false, kv_type));
+            test_cases.emplace_back(new test_flash_attn_ext_head_map(22, 2, 10, 16, 1000, nb, false, kv_type));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_head_map(22, 2, 4, 16, 1000, 1, true));
+    test_cases.emplace_back(new test_flash_attn_ext_head_map(22, 2, 4, 16,   40, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1000, 1, true,  true,  0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1000, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 2}, 1000, 1, false, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1},   40, 1, true,  false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, 1000, 1, true,  false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -10010,6 +10126,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+    // Qwen3-235B-A22B Q2_K decode (n = 1), one rank's share under tensor parallelism over 2 and 3
+    // ranks: hidden 4096, 64 q / 4 kv heads of 128, 128 experts of 1536 rows with 8 used, vocab
+    // 151936. Select with -p 'k=4096|k=768|k=512|kv=1024' or by type.
+    for (int64_t ffn : {768, 512}) { // expert rows per rank, 1536/2 and 1536/3
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 128, 8, true, ffn, 1, 4096));               // ffn_gate_exps, ffn_up_exps
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 128, 8, false, 4096, 1, ffn));              // ffn_down_exps (perf mode times only the last node, so not the fused form)
+    }
+    for (int64_t q : {4096, 2048}) { // q rows per rank: 32 or 16 heads
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, q, 1, 4096, {1, 1}, {1, 1})); // attn_q
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q3_K, GGML_TYPE_F32, 4096, 1, q, {1, 1}, {1, 1})); // attn_output
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 1, 4096, {1, 1}, {1, 1}));   // attn_k, 2 kv heads
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 256, 1, 4096, {1, 1}, {1, 1}));   // attn_v, 2 kv heads
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 128, 1, 4096, {1, 1}, {1, 1}));   // ffn_gate_inp (router)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 75968, 1, 4096, {1, 1}, {1, 1})); // output, half the vocab
+    for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) { // flash attention, 2 kv heads of 16 q heads each
+        for (int64_t kv : {1024, 2048, 4096}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {16, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, kv_type, kv_type));
         }
     }
 
