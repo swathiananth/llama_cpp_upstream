@@ -358,6 +358,7 @@ class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+static void ggml_vk_finish_pending(ggml_backend_vk_context * ctx);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -771,22 +772,19 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    // Work recorded while deferring (ggml_backend_vk_set_defer_submit) goes to the GPU as soon as the
+    // recording ends, behind a wait on a host-set event (the gate), and ggml_backend_vk_flush_deferred
+    // sets the event instead of submitting. gate_ctx: the context whose gate is pending, if any; see
+    // ggml_vk_gate_guard
+    ggml_backend_vk_context * gate_ctx {};
 
     bool shader_64b_indexing;
 
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
-    int32_t dmmv_wg_force; // -1: heuristic, else a dmmv_wg_sizes value (GGML_VK_DMMV_WG)
-    bool xe_mmvq;          // Q2_K/Q3_K decode matvec from mul_mat_vecq_xe.comp
-    uint32_t xe_mmvq_rows; // rows per workgroup for it
-    uint32_t xe_mmvq_mode; // diagnostic mode for it, 0 = normal
-    uint32_t fa_split_wgs; // FA split_k: split the KV range until this many workgroups run, 0 = 2 per shader core
-    uint32_t fa_gqa_rows;  // scalar FA: group up to this many query heads of one KV head per workgroup, 0 = block_rows
-    uint32_t fa_subgroup;  // scalar FA on Intel: subgroup size for the reductions, 0 = shared memory only
-    bool fa_dec_xe;           // single-token Q8_0 flash attention from flash_attn_dec_xe.comp
-    uint32_t fa_dec_xe_chunk; // KV positions per workgroup for it
-    uint32_t fa_dec_xe_diag;  // timing experiments only (wrong results): GGML_VK_FA_DEC_XE_DIAG
+    bool xe_mmvq;   // Q2_K/Q3_K decode matvec from mul_mat_vecq_xe.comp
+    bool fa_dec_xe; // single-token Q8_0 flash attention from flash_attn_dec_xe.comp
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;
@@ -1987,6 +1985,11 @@ static bool vk_enable_sync_logger = false;
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
+// GGML_VK_GRAPH_PROF=N: every N synchronizes, print where the time between the first graph_compute
+// after a synchronize and the end of that synchronize went (CPU recording before the GPU had work,
+// GPU busy span from timestamps, submit-to-wake time the GPU was not busy). For dist-tp decode,
+// where every all-reduce boundary is one graph_compute followed by one synchronize.
+static uint32_t vk_graph_prof = 0;
 
 static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
     if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
@@ -2184,6 +2187,37 @@ struct ggml_backend_vk_context {
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
+    // ggml_backend_vk_set_defer_submit: graph_compute records the whole graph into one command
+    // buffer and keeps it here instead of submitting it; ggml_vk_flush_deferred (also run by
+    // ggml_vk_synchronize) submits it. Lets a caller record the next graph while it is still
+    // waiting for data the graph reads, and start the GPU the moment that data is in place.
+    bool defer_submit {};
+    std::vector<vk_context> deferred_ctxs;
+    // prealloc buffers replaced while recording deferred work: the commands recorded before the
+    // replacement still use them, so they are freed at the next graph cleanup
+    std::vector<vk_buffer> deferred_garbage;
+    // the gate: the event the held work waits on, whether submitted work is waiting for
+    // it (gate_pending) and whether it is set and has to be reset before its next use (gate_set)
+    vk::Event gate_event;
+    bool gate_pending {};
+    bool gate_set {};
+    // early record: the other gate event (window i+1 is recorded while window i may not have passed its
+    // gate wait yet, so consecutive windows take the two in turn) and whether it is set; early_inflight: a window
+    // went out through ggml_vk_early_submit, so the graph cleanup waits for the end of the graph; early_ctx and
+    // early_gprof*: what ggml_vk_early_wait needs, kept apart from what the recording thread changes
+    vk::Event gate_event_alt;
+    bool gate_set_alt {};
+    bool early_inflight {};
+    vk_context early_ctx;
+    bool early_gprof {};
+    int64_t early_gprof_t_sync {}, early_gprof_t0 {}, early_gprof_rec {}, early_gprof_t_submit {};
+    uint32_t early_gprof_submits {}, early_gprof_graphs {};
+    // ggml_backend_vk_early_read: the copy-out goes to early_staging; early_poll_words: how many of its words
+    // ggml_vk_early_wait polls (0: it waits on the fence); early_fence_open: the copy-out was polled and the fence is
+    // still out (waited for before its next use)
+    vk_buffer early_staging;
+    size_t early_poll_words {};
+    bool early_fence_open {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
     bool do_add_rms_partials_offset_calculation;
@@ -2241,6 +2275,14 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // for GGML_VK_GRAPH_PROF: one window runs from the first graph_compute after a synchronize to
+    // the end of the next synchronize
+    vk::QueryPool gprof_pool;
+    bool gprof_open {};
+    int64_t gprof_t0 {}, gprof_t_submit {}, gprof_rec {}, gprof_t_ar {};
+    uint32_t gprof_graphs {}, gprof_submits {}, gprof_n {};
+    double gprof_sum[9] {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -2393,33 +2435,44 @@ static VkDeviceSize ggml_vk_get_max_buffer_range(const ggml_backend_vk_context *
     return range;
 }
 
+// CPU pause instructions between fence checks while spinning for the GPU. A pause can take over a
+// hundred cycles, so the 1000 between checks this replaces could add tens of microseconds to every
+// wait, which a tensor-parallel run pays at every all-reduce.
+static constexpr uint32_t VK_FENCE_POLL_PAUSES = 20;
+
 // Wait for ctx->fence to be signaled.
 static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
     // Use waitForFences while most of the graph executes. Hopefully the CPU can sleep
     // during this wait.
     if (ctx->almost_ready_fence_pending) {
         VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
+        if (vk_graph_prof) {
+            ctx->gprof_t_ar = ggml_time_us();
+        }
         ctx->device->device.resetFences({ ctx->almost_ready_fence });
         ctx->almost_ready_fence_pending = false;
     }
 
     // Spin (w/pause) waiting for the graph to finish executing.
     vk::Result result;
+    int64_t t_wait0 = 0;
     while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
         if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
+            fprintf(stderr, "ggml_vulkan: error %s at %s:%d (gate pending %d set %d)\n", to_string(result).c_str(), __FILE__, __LINE__,
+                    (int) ctx->gate_pending, (int) ctx->gate_set);
             exit(1);
         }
-        for (uint32_t i = 0; i < 100; ++i) {
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
+        if (t_wait0 >= 0) {
+            const int64_t t = ggml_time_us();
+            if (t_wait0 == 0) {
+                t_wait0 = t;
+            } else if (t - t_wait0 > 2000000) {
+                fprintf(stderr, "[vkgate] fence wait over 2 s: gate pending %d set %d, deferred %zu, deferring %d\n",
+                        (int) ctx->gate_pending, (int) ctx->gate_set, ctx->deferred_ctxs.size(), (int) ctx->defer_submit);
+                t_wait0 = -1;
+            }
+        }
+        for (uint32_t i = 0; i < VK_FENCE_POLL_PAUSES; ++i) {
             YIELD();
         }
     }
@@ -3510,9 +3563,8 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         // Disable subgroup use due to performance issues when enforcing subgroup sizes
-        // (GGML_VK_FA_SUBGROUP turns it back on with the given size)
-        result.subgroup_size = device->fa_subgroup ? device->fa_subgroup : 32;
-        result.disable_subgroups = device->fa_subgroup == 0;
+        result.subgroup_size = 32;
+        result.disable_subgroups = true;
     } else if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN) {
         result.subgroup_size = n_rows < 4 ? 32 : device->subgroup_size;
     } else {
@@ -4974,10 +5026,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
-    // Rows per workgroup overrides for the k-quant matvec shaders: GGML_VK_RM_KQ (float path) and
-    // GGML_VK_RM_KQ_INT (integer-dot path).
-    if (const char * s = getenv("GGML_VK_RM_KQ"))     { rm_kq     = std::max(1, atoi(s)); }
-    if (const char * s = getenv("GGML_VK_RM_KQ_INT")) { rm_kq_int = std::max(1, atoi(s)); }
+    // Q6_K (the output matrix of Q2_K/Q3_K models) on its own: 4 rows on Intel Xe2/Xe3 iGPUs, where
+    // it suits the vocabulary-sized output matvec.
+    uint32_t rm_q6k_int = rm_kq_int;
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2) {
+        rm_q6k_int = 4;
+    }
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -5082,16 +5136,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_MXFP4][i], "mul_mat_vec_mxfp4_q8_1_f32", arr_dmmv_mxfp4_q8_1_f32_len[reduc], arr_dmmv_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                 if (device->xe_mmvq) {
-                    const uint32_t rx = device->xe_mmvq_rows;
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32_xe", mul_mat_vec_q2_k_q8_1_f32_xe_len, mul_mat_vec_q2_k_q8_1_f32_xe_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rx, 1, 1}, {16, rx, i+1, device->xe_mmvq_mode}, 1, true, true, 16);
-                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32_xe", mul_mat_vec_q3_k_q8_1_f32_xe_len, mul_mat_vec_q3_k_q8_1_f32_xe_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rx, 1, 1}, {16, rx, i+1, device->xe_mmvq_mode}, 1, true, true, 16);
+                    const uint32_t rx = 8;
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32_xe", mul_mat_vec_q2_k_q8_1_f32_xe_len, mul_mat_vec_q2_k_q8_1_f32_xe_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rx, 1, 1}, {16, rx, i+1}, 1, true, true, 16);
+                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32_xe", mul_mat_vec_q3_k_q8_1_f32_xe_len, mul_mat_vec_q3_k_q8_1_f32_xe_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rx, 1, 1}, {16, rx, i+1}, 1, true, true, 16);
                 } else {
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_q8_1_f32", arr_dmmv_q2_k_q8_1_f32_len[reduc], arr_dmmv_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_q8_1_f32", arr_dmmv_q3_k_q8_1_f32_len[reduc], arr_dmmv_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 }
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_q8_1_f32", arr_dmmv_q4_k_q8_1_f32_len[reduc], arr_dmmv_q4_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_q8_1_f32", arr_dmmv_q5_k_q8_1_f32_len[reduc], arr_dmmv_q5_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_q8_1_f32", arr_dmmv_q6_k_q8_1_f32_len[reduc], arr_dmmv_q6_k_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_q6k_int, 1, 1}, {wg_size_subgroup_int, rm_q6k_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
 
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_S][i], "mul_mat_vec_iq1_s_q8_1_f32", arr_dmmv_iq1_s_q8_1_f32_len[reduc], arr_dmmv_iq1_s_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_IQ1_M][i], "mul_mat_vec_iq1_m_q8_1_f32", arr_dmmv_iq1_m_q8_1_f32_len[reduc], arr_dmmv_iq1_m_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_iq_int(i), 1, 1}, {wg_size_subgroup_int, 1*rm_iq_int(i), i+1}, 1, true, use_subgroups, subgroup_size_int);
@@ -5142,9 +5196,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_MXFP4], "mul_mat_vec_id_mxfp4_q8_1_f32", arr_dmmv_id_mxfp4_q8_1_f32_len[reduc], arr_dmmv_id_mxfp4_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_stdq_int}, 1, true, use_subgroups, subgroup_size_int);
 
             if (device->xe_mmvq) {
-                const uint32_t rx = device->xe_mmvq_rows;
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32_xe", mul_mat_vec_id_q2_k_q8_1_f32_xe_len, mul_mat_vec_id_q2_k_q8_1_f32_xe_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rx, 1, 1}, {16, rx, 1, device->xe_mmvq_mode}, 1, true, true, 16);
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32_xe", mul_mat_vec_id_q3_k_q8_1_f32_xe_len, mul_mat_vec_id_q3_k_q8_1_f32_xe_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rx, 1, 1}, {16, rx, 1, device->xe_mmvq_mode}, 1, true, true, 16);
+                const uint32_t rx = 8;
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32_xe", mul_mat_vec_id_q2_k_q8_1_f32_xe_len, mul_mat_vec_id_q2_k_q8_1_f32_xe_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rx, 1, 1}, {16, rx, 1}, 1, true, true, 16);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32_xe", mul_mat_vec_id_q3_k_q8_1_f32_xe_len, mul_mat_vec_id_q3_k_q8_1_f32_xe_data, "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {rx, 1, 1}, {16, rx, 1}, 1, true, true, 16);
             } else {
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q2_K], "mul_mat_vec_id_q2_k_q8_1_f32", arr_dmmv_id_q2_k_q8_1_f32_len[reduc], arr_dmmv_id_q2_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[w][GGML_TYPE_Q3_K], "mul_mat_vec_id_q3_k_q8_1_f32", arr_dmmv_id_q3_k_q8_1_f32_len[reduc], arr_dmmv_id_q3_k_q8_1_f32_data[reduc], "main", mul_mat_vec_id_num_bindings, sizeof(vk_mat_vec_id_push_constants), {1*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_kq_int}, 1, true, use_subgroups, subgroup_size_int);
@@ -6808,56 +6862,19 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Q2_K/Q3_K decode matvec with fewer instructions per block (mul_mat_vecq_xe.comp) on Intel Xe2/Xe3
         // (read by ggml_vk_load_shaders, so set before it):
-        // GGML_VK_DISABLE_XE_MMVQ turns it off, GGML_VK_XE_MMVQ_ROWS sets the rows per workgroup (a multiple of 4).
+        // GGML_VK_DISABLE_XE_MMVQ turns it off.
         device->xe_mmvq = device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2 &&
                           device->integer_dot_product && device->subgroup_size_control && device->subgroup_require_full_support &&
-                          device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16 && device->subgroup_arithmetic && !getenv("GGML_VK_DISABLE_XE_MMVQ");
-        /*if (const char * s = getenv("GGML_VK_XE_MMVQ")) {
-            device->xe_mmvq = device->xe_mmvq && atoi(s) != 0;
-        }*/
-        device->xe_mmvq_rows = 8;
-        if (const char * s = getenv("GGML_VK_XE_MMVQ_ROWS")) {
-            device->xe_mmvq_rows = std::max(1, (atoi(s) + 3) / 4) * 4;
-        }
-        device->xe_mmvq_mode = 0;
-        if (const char * s = getenv("GGML_VK_XE_MODE")) {
-            device->xe_mmvq_mode = atoi(s);
-        }
-
-        // Flash attention tuning (0 = upstream behaviour): GGML_VK_FA_SPLIT_WGS, GGML_VK_FA_GQA_ROWS,
-        // GGML_VK_FA_SUBGROUP, see the fields.
-        device->fa_split_wgs = 0;
-        if (const char * s = getenv("GGML_VK_FA_SPLIT_WGS")) {
-            device->fa_split_wgs = std::max(0, atoi(s));
-        }
-        device->fa_gqa_rows = 0;
-        if (const char * s = getenv("GGML_VK_FA_GQA_ROWS")) {
-            device->fa_gqa_rows = std::min(32, std::max(0, atoi(s)));
-        }
-        device->fa_subgroup = 0;
-        if (const char * s = getenv("GGML_VK_FA_SUBGROUP")) {
-            const uint32_t sg = std::max(0, atoi(s));
-            device->fa_subgroup = sg >= device->subgroup_min_size && sg <= device->subgroup_max_size ? sg : 0;
-        }
+                          device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16 && device->subgroup_arithmetic &&
+                          !getenv("GGML_VK_DISABLE_XE_MMVQ");
 
         // Single-token flash attention over a Q8_0 cache with head size 128 and 16 query heads per KV
-        // head (flash_attn_dec_xe.comp), on the same devices as the Xe matvec: GGML_VK_DISABLE_FA_DEC_XE=0 turns
-        // it off, GGML_VK_FA_DEC_XE_CHUNK sets the KV positions per workgroup (32, 64 or 128).
+        // head (flash_attn_dec_xe.comp), on the same devices as the Xe matvec: GGML_VK_DISABLE_FA_DEC_XE
+        // turns it off.
         device->fa_dec_xe = device->vendor_id == VK_VENDOR_ID_INTEL && device->architecture == vk_device_architecture::INTEL_XE2 &&
                             device->integer_dot_product && device->subgroup_size_control && device->subgroup_require_full_support &&
-                            device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16 && !getenv("GGML_VK_DISABLE_FA_DEC_XE");
-        /*if (const char * s = getenv("GGML_VK_FA_DEC_XE")) {
-            device->fa_dec_xe = device->fa_dec_xe && atoi(s) != 0;
-        }*/
-        device->fa_dec_xe_chunk = 128;
-        if (const char * s = getenv("GGML_VK_FA_DEC_XE_CHUNK")) {
-            const int ch = atoi(s);
-            device->fa_dec_xe_chunk = ch <= 32 ? 32 : ch <= 64 ? 64 : 128;
-        }
-        device->fa_dec_xe_diag = 0;
-        if (const char * s = getenv("GGML_VK_FA_DEC_XE_DIAG")) {
-            device->fa_dec_xe_diag = (uint32_t) atoi(s) & 3;
-        }
+                            device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16 &&
+                            !getenv("GGML_VK_DISABLE_FA_DEC_XE");
 
         ggml_vk_load_shaders(device);
 
@@ -6906,12 +6923,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = -1;
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
-        }
-
-        // Matvec workgroup size override: GGML_VK_DMMV_WG=subgroup or large.
-        device->dmmv_wg_force = -1;
-        if (const char * s = getenv("GGML_VK_DMMV_WG")) {
-            device->dmmv_wg_force = strcmp(s, "large") == 0 ? DMMV_WG_SIZE_LARGE : DMMV_WG_SIZE_SUBGROUP;
         }
 
         return device;
@@ -7249,6 +7260,9 @@ static void ggml_vk_instance_init() {
     }
 
     vk_perf_logger_enabled = getenv("GGML_VK_PERF_LOGGER") != nullptr;
+    if (const char * s = getenv("GGML_VK_GRAPH_PROF")) {
+        vk_graph_prof = (uint32_t)std::max(0, atoi(s));
+    }
     vk_perf_logger_concurrent = getenv("GGML_VK_PERF_LOGGER_CONCURRENT") != nullptr;
     vk_enable_sync_logger = getenv("GGML_VK_SYNC_LOGGER") != nullptr;
     vk_memory_logger_enabled = getenv("GGML_VK_MEMORY_LOGGER") != nullptr;
@@ -7666,15 +7680,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
-        if (ctx->device->dmmv_wg_force >= 0) {
-            dmmv_wg = ctx->device->dmmv_wg_force;
-        }
         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
     }
 
-    if (ctx->device->dmmv_wg_force >= 0) {
-        dmmv_wg = ctx->device->dmmv_wg_force;
-    }
     return b_type == GGML_TYPE_F32 ? ctx->device->pipeline_dequant_mul_mat_vec_f32_f32[dmmv_wg][a_type][num_cols-1] : ctx->device->pipeline_dequant_mul_mat_vec_f16_f32[dmmv_wg][a_type][num_cols-1];
 }
 
@@ -7837,15 +7845,9 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
         }
-        if (ctx->device->dmmv_wg_force >= 0) {
-            dmmv_wg = ctx->device->dmmv_wg_force;
-        }
         return ctx->device->pipeline_dequant_mul_mat_vec_id_q8_1_f32[dmmv_wg][a_type];
     }
 
-    if (ctx->device->dmmv_wg_force >= 0) {
-        dmmv_wg = ctx->device->dmmv_wg_force;
-    }
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
@@ -8055,6 +8057,33 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
 
         ctx->compute_ctx = result;
         ggml_vk_ctx_begin(ctx->device, result);
+
+        if (ctx->defer_submit) {
+            // held back by the host: nothing runs until ggml_vk_open_gate sets the event (the GPU is
+            // idle while recording ahead, so the event can be reset here)
+            if (!ctx->gate_event) {
+                ctx->gate_event = ctx->device->device.createEvent({});
+            } else if (ctx->gate_set) {
+                ctx->device->device.resetEvent(ctx->gate_event);
+            }
+            ctx->gate_set = false;
+            // pending from here on: this command buffer may be submitted by a later synchronize (a graph
+            // with no GPU nodes leaves it open instead of deferring it), and it must find the event set
+            ctx->gate_pending = true;
+            ctx->device->gate_ctx = ctx;
+            // (memory barrier written as a braced list: windows.h defines MemoryBarrier as a macro)
+            result->s->buffer->buf.waitEvents(
+                { ctx->gate_event },
+                vk::PipelineStageFlagBits::eHost,
+                vk::PipelineStageFlagBits::eAllCommands,
+                { {
+                  { vk::AccessFlagBits::eHostWrite },
+                  { vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite }
+                } },
+                {},
+                {}
+            );
+        }
     }
 
     if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
@@ -8313,6 +8342,23 @@ static bool ggml_vk_buffer_write_async(vk_context subctx, vk_buffer& dst, size_t
     return ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, size, size, size, 1, sync_staging);
 }
 
+static void ggml_vk_open_gate(ggml_backend_vk_context * ctx);
+
+// The gate: a blocking device-level wait queued behind held work would wait for the
+// host to release that work, which it does only after this call returns. Release it first (the
+// work then runs on whatever data is in place; the output check catches a wrong result) and say so.
+static void ggml_vk_gate_guard(vk_device & device, const char * site) {
+    ggml_backend_vk_context * gctx = device->gate_ctx;
+    if (gctx == nullptr) {
+        return;
+    }
+    static int warned = 0;
+    if (warned++ < 4) {
+        fprintf(stderr, "[vkgate] %s waits for the GPU while held work is pending; releasing it\n", site);
+    }
+    ggml_vk_open_gate(gctx);
+}
+
 static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d(" << width << ", " << height << ")");
     // Buffer is already mapped
@@ -8343,6 +8389,7 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
             memset(mset.dst, mset.val, mset.n);
         }
 
+        ggml_vk_gate_guard(dst->device, "buffer_write_2d");
         ggml_vk_submit(subctx, dst->device->fence);
         VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_buffer_write_2d waitForFences");
         dst->device->device.resetFences({ dst->device->fence });
@@ -8354,6 +8401,10 @@ static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src
     VK_LOG_DEBUG("ggml_vk_buffer_write(" << size << ")");
     ggml_vk_buffer_write_2d(dst, offset, src, size, size, size, 1);
 }
+
+// ggml_backend_vk_early_read: a quiet NaN no kernel produces (as two f16 halves the high one is a NaN too)
+#define GGML_VK_EARLY_READ_SENTINEL 0x7FBADBADu
+#define GGML_VK_EARLY_READ_MAX      (256u * 1024u)
 
 static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size_t offset, void * dst, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_read_2d_async(offset=" << offset << ", width=" << width << ", height=" << height << ")");
@@ -8454,6 +8505,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
                 vk::AccessFlagBits::eHostRead } },
             {}, {});
         ggml_vk_ctx_end(subctx);
+        ggml_vk_gate_guard(src->device, "buffer_read_2d");
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX),
                  "vk_buffer_read_2d uma waitForFences");
@@ -8476,6 +8528,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         GGML_ASSERT(ret);
         ggml_vk_ctx_end(subctx);
 
+        ggml_vk_gate_guard(src->device, "buffer_read_2d");
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_read_2d waitForFences");
         src->device->device.resetFences({ src->device->fence });
@@ -8511,6 +8564,7 @@ static void ggml_vk_buffer_copy(vk_buffer& dst, size_t dst_offset, vk_buffer& sr
         ggml_vk_ctx_begin(src->device, subctx);
         ggml_vk_buffer_copy_async(subctx, dst, dst_offset, src, src_offset, size);
         ggml_vk_ctx_end(subctx);
+        ggml_vk_gate_guard(src->device, "buffer_copy");
         ggml_vk_submit(subctx, src->device->fence);
         VK_CHECK(src->device->device.waitForFences({ src->device->fence }, true, UINT64_MAX), "vk_buffer_copy waitForFences");
         src->device->device.resetFences({ src->device->fence });
@@ -8555,6 +8609,7 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
     ggml_vk_ctx_end(subctx);
 
+    ggml_vk_gate_guard(dst->device, "buffer_memset");
     ggml_vk_submit(subctx, dst->device->fence);
     VK_CHECK(dst->device->device.waitForFences({ dst->device->fence }, true, UINT64_MAX), "vk_memset waitForFences");
     dst->device->device.resetFences({ dst->device->fence });
@@ -10599,7 +10654,7 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // ggml_vk_flash_attn has checked the shapes, types and strides.
 static void ggml_vk_flash_attn_dec_xe(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     const uint32_t HSV   = 128;
-    const uint32_t CH    = ctx->device->fa_dec_xe_chunk;
+    const uint32_t CH    = 128;
     const uint32_t KV    = (uint32_t) k->ne[1];
     const uint32_t k_num = CEIL_DIV(KV, CH);
     const uint32_t ne1   = (uint32_t) dst->ne[1];
@@ -10748,7 +10803,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
     vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc);
-    const uint32_t max_gqa = std::min(std::max(tuning_params.block_rows, ctx->device->fa_gqa_rows), 32u);
+    const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     if (!hm && N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
         qk_ratio * nek2 == neq2 && nek2 == nev2 && nem2 <= 1) {
@@ -10761,11 +10816,6 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     }
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, v->type, f32acc);
-
-    // A group wider than the tuned block (GGML_VK_FA_GQA_ROWS) still takes one workgroup per KV head.
-    if (gqa_ratio > tuning_params.block_rows && tuning_params.path == FA_SCALAR) {
-        tuning_params.block_rows = gqa_ratio;
-    }
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -10840,16 +10890,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     const uint32_t Tr = CEIL_DIV(N, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
-    // On Intel the scalar workgroup is small, so two per core leave most of each Xe core
-    // idle when there are only a few rows (decode). Aim for 16 per core instead.
-    const uint32_t wgs_per_core = (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && tuning_params.path == FA_SCALAR) ? 16 : 2;
-    const uint32_t split_wgs = ctx->device->fa_split_wgs ? ctx->device->fa_split_wgs : shader_core_count * wgs_per_core;
     if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = split_wgs / (workgroups_x * workgroups_y * workgroups_z);
+        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
+        // On Intel the scalar workgroup is small, so two per core leave most of each Xe core
+        // idle when there are only a few rows (decode). Aim for 16 per core instead.
+        const uint32_t wgs_per_core = (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && tuning_params.path == FA_SCALAR) ? 16 : 2;
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < split_wgs) {
-            split_k = split_wgs / total_wgs_no_split;
+        if (total_wgs_no_split < shader_core_count * wgs_per_core) {
+            split_k = shader_core_count * wgs_per_core / total_wgs_no_split;
         }
     }
 
@@ -14874,6 +14923,17 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
 }
 #endif
 
+// Replace a prealloc buffer: destroy it, or keep it alive until the next graph cleanup when
+// commands already recorded (and not yet submitted) may still use it.
+static void ggml_vk_retire_prealloc(ggml_backend_vk_context * ctx, vk_buffer & buf, bool keep) {
+    if (keep) {
+        ctx->deferred_garbage.push_back(buf);
+        buf.reset();
+    } else {
+        ggml_vk_destroy_buffer(buf);
+    }
+}
+
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
 #if defined(GGML_VULKAN_RUN_TESTS)
     const std::vector<size_t> vals {
@@ -14964,7 +15024,10 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     GGML_ABORT("fatal error");
 #endif
 
-    if (subctx) {
+    // Recording deferred work: no submit and wait here, the old buffers stay alive instead
+    // (also without a context while submitted work may still use the old buffers: graph start)
+    const bool keep_old = (subctx && ctx->defer_submit) || (!subctx && (ctx->submit_pending || ctx->early_inflight));
+    if (subctx && !keep_old) {
         // Submit and wait for any pending work before reallocating the buffers
         ggml_vk_ctx_end(subctx);
         ggml_vk_submit(subctx, {});
@@ -14979,7 +15042,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(x_size: " << ctx->prealloc_size_x << ")");
         // Resize buffer
         if (ctx->prealloc_x != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_x);
+            ggml_vk_retire_prealloc(ctx, ctx->prealloc_x, keep_old);
         }
         ctx->prealloc_x = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_x);
     }
@@ -14987,7 +15050,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
         // Resize buffer
         if (ctx->prealloc_y != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_y);
+            ggml_vk_retire_prealloc(ctx, ctx->prealloc_y, keep_old);
         }
         ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_y);
         ctx->prealloc_y_last_pipeline_used = nullptr;
@@ -14998,7 +15061,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
         // Resize buffer
         if (ctx->prealloc_split_k != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+            ggml_vk_retire_prealloc(ctx, ctx->prealloc_split_k, keep_old);
         }
         ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_split_k);
     }
@@ -15006,7 +15069,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
         // Resize buffer
         if (ctx->prealloc_add_rms_partials != nullptr) {
-            ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+            ggml_vk_retire_prealloc(ctx, ctx->prealloc_add_rms_partials, keep_old);
         }
         ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_add_rms_partials);
     }
@@ -15544,6 +15607,11 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
 
     vk_context subctx = ctx->tensor_ctxs[tensor_idx].lock();
 
+    if (ctx->defer_submit) {
+        ctx->deferred_ctxs.push_back(subctx);
+        return;
+    }
+
     // Only run if ctx hasn't been submitted yet
     if (!subctx->seqs.empty()) {
 #ifdef GGML_VULKAN_CHECK_RESULTS
@@ -15566,6 +15634,9 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
             ggml_vk_submit(subctx, {});
         }
         ctx->submit_pending = true;
+        if (vk_graph_prof && ctx->gprof_open && ctx->gprof_submits++ == 0) {
+            ctx->gprof_t_submit = ggml_time_us();
+        }
 
 #ifdef GGML_VULKAN_CHECK_RESULTS
         ggml_vk_synchronize(ctx);
@@ -15584,9 +15655,56 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context * ctx, ggml_cgraph *
     }
 }
 
+// Submit the work recorded while defer_submit was set, in recording order (what
+// ggml_vk_compute_forward would have done at each submit point).
+static void ggml_vk_flush_deferred(ggml_backend_vk_context * ctx, bool prof_submit = true) {
+    for (auto & subctx : ctx->deferred_ctxs) {
+        if (!subctx->seqs.empty()) {
+            for (auto& cpy : subctx->in_memcpys) {
+                memcpy(cpy.dst, cpy.src, cpy.n);
+            }
+            for (auto& mset : subctx->memsets) {
+                memset(mset.dst, mset.val, mset.n);
+            }
+            ggml_vk_submit(subctx, {});
+            ctx->submit_pending = true;
+            if (prof_submit && vk_graph_prof && ctx->gprof_open && ctx->gprof_submits++ == 0) {
+                ctx->gprof_t_submit = ggml_time_us();
+            }
+        }
+        for (auto& cpy : subctx->out_memcpys) {
+            memcpy(cpy.dst, cpy.src, cpy.n);
+        }
+        subctx->in_memcpys.clear();
+        subctx->out_memcpys.clear();
+        subctx->memsets.clear();
+    }
+    ctx->deferred_ctxs.clear();
+}
+
+// Let the submitted work that waits on gate_event run
+static void ggml_vk_open_gate(ggml_backend_vk_context * ctx) {
+    if (!ctx->gate_pending) {
+        return;
+    }
+    ctx->device->device.setEvent(ctx->gate_event);
+    ctx->gate_pending = false;
+    ctx->gate_set = true;
+    if (ctx->device->gate_ctx == ctx) {
+        ctx->device->gate_ctx = nullptr;
+    }
+    if (vk_graph_prof && ctx->gprof_open && ctx->gprof_submits++ == 0) {
+        ctx->gprof_t_submit = ggml_time_us();
+    }
+}
+
 // Clean up after graph processing is done
 static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_graph_cleanup()");
+    for (auto & buf : ctx->deferred_garbage) {
+        ggml_vk_destroy_buffer(buf);
+    }
+    ctx->deferred_garbage.clear();
     ctx->prealloc_y_last_pipeline_used = {};
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
@@ -15623,6 +15741,15 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->descriptor_set_idx = 0;
 }
 
+// Early record: ggml_vk_early_wait returned when it saw the copy-out land, with the fence still out.
+// Wait for it before anything reuses the fence.
+static void ggml_vk_finish_pending(ggml_backend_vk_context * ctx) {
+    if (ctx->early_fence_open) {
+        ggml_vk_wait_for_fence(ctx);
+        ctx->early_fence_open = false;
+    }
+}
+
 // Clean up on backend free
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
@@ -15638,6 +15765,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+    ggml_vk_destroy_buffer(ctx->early_staging);
 
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
@@ -15654,6 +15782,18 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
+    if (ctx->gprof_pool) {
+        ctx->device->device.destroyQueryPool(ctx->gprof_pool);
+    }
+    if (ctx->gate_event) {
+        ctx->device->device.destroyEvent(ctx->gate_event);
+    }
+    if (ctx->gate_event_alt) {
+        ctx->device->device.destroyEvent(ctx->gate_event_alt);
+    }
+    if (ctx->device->gate_ctx == ctx) {
+        ctx->device->gate_ctx = nullptr;
+    }
 
     for (auto& pool : ctx->descriptor_pools) {
         ctx->device->device.destroyDescriptorPool(pool);
@@ -16057,6 +16197,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
     if (!ret) {
         const size_t staging_size = size * n_copies;
         ggml_vk_ensure_sync_staging_buffer(ctx, staging_size);
+        const vk_buffer & staging = ctx->sync_staging;
         ggml_vk_sync_buffers(nullptr, compute_ctx);
 
         std::vector<vk::BufferCopy> slices(1);
@@ -16073,13 +16214,13 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
             }
         }
 
-        compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
+        compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, staging->buffer, slices);
 
         if (size == stride_data) {
-            deferred_memcpy(data, ctx->sync_staging->ptr, staging_size, &compute_ctx->out_memcpys);
+            deferred_memcpy(data, staging->ptr, staging_size, &compute_ctx->out_memcpys);
         } else {
             for (size_t i = 0; i < n_copies; i++) {
-                deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)ctx->sync_staging->ptr + i * size, size, &compute_ctx->out_memcpys);
+                deferred_memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)staging->ptr + i * size, size, &compute_ctx->out_memcpys);
             }
         }
         ggml_vk_synchronize(ctx);
@@ -16150,6 +16291,13 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
 static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
+    ggml_vk_finish_pending(ctx);
+
+    if (!ctx->deferred_ctxs.empty()) {
+        ggml_vk_flush_deferred(ctx);
+    }
+    ggml_vk_open_gate(ctx);
+
     bool do_transfer = !ctx->compute_ctx.expired();
 
     if (ggml_vk_submit_transfer_ctx(ctx)) {
@@ -16158,10 +16306,19 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
 
     vk_context compute_ctx;
     vk_command_buffer* cmd_buf = nullptr;
+    bool gprof_measure = false;
+    int64_t gprof_t_sync = 0;
     if (do_transfer) {
         compute_ctx = ctx->compute_ctx.lock();
         if (compute_ctx->s) {
             cmd_buf = compute_ctx->s->buffer;
+        }
+
+        if (vk_graph_prof && ctx->gprof_open && cmd_buf) {
+            cmd_buf->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ctx->gprof_pool, 1);
+            gprof_measure = true;
+            gprof_t_sync = ggml_time_us();
+            ctx->gprof_t_ar = 0;
         }
 
         ggml_vk_ctx_end(compute_ctx);
@@ -16194,6 +16351,37 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
         ggml_vk_wait_for_fence(ctx);
         ctx->submit_pending = false;
+        if (ctx->gate_set) {
+            ctx->device->device.resetEvent(ctx->gate_event);
+            ctx->gate_set = false;
+        }
+        if (gprof_measure) {
+            const int64_t t_done = ggml_time_us();
+            uint64_t ts[2] = {};
+            VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->gprof_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "GGML_VK_GRAPH_PROF results");
+            const double gpu_us = double(ts[1] - ts[0]) * ctx->device->properties.limits.timestampPeriod / 1000.0;
+            const int64_t t_submit = ctx->gprof_submits ? ctx->gprof_t_submit : gprof_t_sync;
+            if (ts[1] >= ts[0] && gpu_us < 1e6) {
+                double * a = ctx->gprof_sum;
+                a[0] += double(t_submit - ctx->gprof_t0);                                // CPU recording, GPU idle
+                a[1] += double(ctx->gprof_rec);                                          // inside graph_compute
+                a[2] += double(gprof_t_sync - ctx->gprof_t0 - ctx->gprof_rec);           // between compute and synchronize
+                a[3] += double(t_done - gprof_t_sync);                                   // in synchronize
+                a[4] += double(ctx->gprof_t_ar ? t_done - ctx->gprof_t_ar : 0);          // spin after the almost-ready wake
+                a[5] += gpu_us;                                                           // GPU busy span
+                a[6] += double(t_done - t_submit) - gpu_us;                              // GPU had work, was not busy
+                a[7] += double(ctx->gprof_submits);
+                a[8] += double(ctx->gprof_graphs);
+                if (++ctx->gprof_n == vk_graph_prof) {
+                    const double n = double(ctx->gprof_n);
+                    fprintf(stderr, "[vkgprof] %u windows, us/window: pre-submit %.1f compute %.1f between %.1f sync %.1f (spin %.1f) gpu-busy %.1f gpu-not-busy %.1f | submits %.2f graphs %.2f\n",
+                            ctx->gprof_n, a[0] / n, a[1] / n, a[2] / n, a[3] / n, a[4] / n, a[5] / n, a[6] / n, a[7] / n, a[8] / n);
+                    ctx->gprof_n = 0;
+                    std::fill(std::begin(ctx->gprof_sum), std::end(ctx->gprof_sum), 0.0);
+                }
+            }
+            ctx->gprof_open = false;
+        }
         if (cmd_buf) {
             cmd_buf->in_use = false;
             cmd_buf->buf.reset();
@@ -16213,8 +16401,184 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ggml_vk_synchronize(ctx);
+    ctx->early_inflight = false;
 
     ggml_vk_graph_cleanup(ctx);
+}
+
+// Early record (dist-tp record-ahead), the first half of ggml_vk_synchronize. Submits the open command buffer
+// (the window's copy-out) with the fence and returns without waiting, so the caller can record the next window
+// and submit it behind the gate while the GPU still runs this one; ggml_vk_early_wait then waits. Returns false
+// without changing anything when it does not apply, and the caller synchronizes as before.
+static bool ggml_vk_early_submit(ggml_backend_vk_context * ctx) {
+    const vk_device & dev = ctx->device;
+    if (dev->async_use_transfer_queue || !dev->support_async || vk_perf_logger_enabled ||
+        ctx->compute_ctx.expired() || ctx->early_ctx) {
+        return false;
+    }
+    if (ctx->early_fence_open) {
+        // the previous polled copy-out: its window is done, the fence is reset before it goes out again
+        ggml_vk_wait_for_fence(ctx);
+        ctx->early_fence_open = false;
+    }
+    if (!ctx->deferred_ctxs.empty()) {
+        ggml_vk_flush_deferred(ctx);
+    }
+    ggml_vk_open_gate(ctx);
+
+    vk_context compute_ctx = ctx->compute_ctx.lock();
+    vk_command_buffer * cmd_buf = compute_ctx->s ? compute_ctx->s->buffer : nullptr;
+    ctx->early_gprof = false;
+    if (vk_graph_prof && ctx->gprof_open && cmd_buf) {
+        cmd_buf->buf.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, ctx->gprof_pool, 1);
+        ctx->early_gprof          = true;
+        ctx->early_gprof_t_sync   = ggml_time_us();
+        ctx->early_gprof_t0       = ctx->gprof_t0;
+        ctx->early_gprof_rec      = ctx->gprof_rec;
+        ctx->early_gprof_t_submit = ctx->gprof_t_submit;
+        ctx->early_gprof_submits  = ctx->gprof_submits;
+        ctx->early_gprof_graphs   = ctx->gprof_graphs;
+        ctx->gprof_t_ar = 0;
+        // the next window opens its own profile window
+        ctx->gprof_open = false;
+    }
+    ggml_vk_ctx_end(compute_ctx);
+    for (auto & cpy : compute_ctx->in_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    // the fence covers every earlier submission too: the window itself, held work and the copy-out
+    ggml_vk_submit(compute_ctx, ctx->fence);
+    ctx->submit_pending = false;
+    ctx->compute_ctx.reset();
+    ctx->early_ctx = compute_ctx;
+    ctx->early_inflight = true;
+    // the next window waits on the other event: this one may not have passed its gate wait yet. The other
+    // event was last used two windows ago, and that window's fence has been waited for since.
+    std::swap(ctx->gate_event, ctx->gate_event_alt);
+    std::swap(ctx->gate_set, ctx->gate_set_alt);
+    return true;
+}
+
+// Early record, the second half: wait for the fence of ggml_vk_early_submit and deliver the copy-out. Runs
+// while the record-ahead thread records into this context, so it touches only the fence, the profile sums and
+// early_*; the command buffer stays in use until the graph cleanup at the end of the graph.
+static void ggml_vk_early_wait(ggml_backend_vk_context * ctx) {
+    vk_context compute_ctx = std::move(ctx->early_ctx);
+    ctx->early_ctx.reset();
+    GGML_ASSERT(compute_ctx);
+    // Poll the staging words of ggml_vk_early_read when that copy-out is the only one in the
+    // command buffer; the fence stays out (early_fence_open) and is waited for before its next use
+    int how = 1;
+    if (ctx->early_poll_words != 0 && compute_ctx->out_memcpys.size() == 1) {
+        if (ctx->almost_ready_fence_pending) {
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->almost_ready_fence }, true, UINT64_MAX), "almost_ready_fence");
+            if (vk_graph_prof) {
+                ctx->gprof_t_ar = ggml_time_us();
+            }
+            ctx->device->device.resetFences({ ctx->almost_ready_fence });
+            ctx->almost_ready_fence_pending = false;
+        }
+        const volatile uint32_t * w = (const volatile uint32_t *) ctx->early_staging->ptr;
+        const size_t nw = ctx->early_poll_words;
+        const int64_t t0 = ggml_time_us();
+        how = 0;
+        size_t k = 0;
+        while (k < nw) {
+            if (w[k] != GGML_VK_EARLY_READ_SENTINEL) {
+                ++k;
+                continue;
+            }
+            if (ggml_time_us() - t0 > 2000) {
+                how = 2;
+                break;
+            }
+            for (uint32_t i = 0; i < VK_FENCE_POLL_PAUSES; ++i) {
+                YIELD();
+            }
+        }
+    }
+    ctx->early_poll_words = 0;
+    if (how == 0) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        ctx->early_fence_open = true;
+    } else {
+        ggml_vk_wait_for_fence(ctx);
+    }
+    if (ctx->early_gprof) {
+        ctx->early_gprof = false;
+        const int64_t t_done = ggml_time_us();
+        uint64_t ts[2] = {};
+        VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->gprof_pool, 0, 2, sizeof(ts), ts, sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "GGML_VK_GRAPH_PROF results");
+        const double gpu_us = double(ts[1] - ts[0]) * ctx->device->properties.limits.timestampPeriod / 1000.0;
+        const int64_t t_submit = ctx->early_gprof_submits ? ctx->early_gprof_t_submit : ctx->early_gprof_t_sync;
+        if (ts[1] >= ts[0] && gpu_us < 1e6) {
+            double * a = ctx->gprof_sum;
+            a[0] += double(t_submit - ctx->early_gprof_t0);
+            a[1] += double(ctx->early_gprof_rec);
+            a[2] += double(ctx->early_gprof_t_sync - ctx->early_gprof_t0 - ctx->early_gprof_rec);
+            a[3] += double(t_done - ctx->early_gprof_t_sync);
+            a[4] += double(ctx->gprof_t_ar ? t_done - ctx->gprof_t_ar : 0);
+            a[5] += gpu_us;
+            a[6] += double(t_done - t_submit) - gpu_us;
+            a[7] += double(ctx->early_gprof_submits);
+            a[8] += double(ctx->early_gprof_graphs);
+            if (++ctx->gprof_n == vk_graph_prof) {
+                const double n = double(ctx->gprof_n);
+                fprintf(stderr, "[vkgprof] %u windows (early), us/window: pre-submit %.1f compute %.1f between %.1f sync %.1f (spin %.1f) gpu-busy %.1f gpu-not-busy %.1f | submits %.2f graphs %.2f\n",
+                        ctx->gprof_n, a[0] / n, a[1] / n, a[2] / n, a[3] / n, a[4] / n, a[5] / n, a[6] / n, a[7] / n, a[8] / n);
+                ctx->gprof_n = 0;
+                std::fill(std::begin(ctx->gprof_sum), std::end(ctx->gprof_sum), 0.0);
+            }
+        }
+    }
+    for (auto & cpy : compute_ctx->out_memcpys) {
+        memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+}
+
+// Early record with the record-ahead caller: record the read of a boundary tensor into the open command buffer
+// (to early_staging, then a deferred memcpy to data) and submit it with ggml_vk_early_submit, without waiting; the
+// caller then posts the next window to the recording thread and calls ggml_vk_early_wait. A plain get_tensor_async
+// into unpinned memory synchronizes by itself, which is why the caller needs this call. False without recording
+// anything when it does not apply (the caller then reads as before).
+static bool ggml_vk_early_read(ggml_backend_vk_context * ctx, const ggml_tensor * tensor, void * data, size_t size) {
+    vk_device & dev = ctx->device;
+    if (dev->async_use_transfer_queue ||
+        !dev->support_async || vk_perf_logger_enabled || ctx->early_ctx || ctx->defer_submit ||
+        !ctx->deferred_ctxs.empty() || size == 0 || size % sizeof(uint32_t) != 0 || size > GGML_VK_EARLY_READ_MAX) {
+        return false;
+    }
+    if (ctx->early_staging == nullptr) {
+        ctx->early_staging = ggml_vk_create_buffer_check(dev, GGML_VK_EARLY_READ_MAX,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+    if (ctx->early_fence_open) {
+        // the previous polled copy-out: its window is done, the fence is reset before it goes out again
+        ggml_vk_wait_for_fence(ctx);
+        ctx->early_fence_open = false;
+    }
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
+    vk_buffer buf = buf_ctx->dev_buffer;
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    vk::BufferCopy region { vk_tensor_offset(tensor) + tensor->view_offs, 0, size };
+    compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->early_staging->buffer, { region });
+    // (memory barrier written as a braced list: windows.h defines MemoryBarrier as a macro)
+    compute_ctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost,
+        {},
+        { { vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eHostRead } },
+        {}, {});
+    deferred_memcpy(data, ctx->early_staging->ptr, size, &compute_ctx->out_memcpys);
+    // the previous copy-out was copied to its caller already; the GPU overwrites every word after this submit
+    uint32_t * w = (uint32_t *) ctx->early_staging->ptr;
+    std::fill(w, w + size / sizeof(uint32_t), GGML_VK_EARLY_READ_SENTINEL);
+    ctx->early_poll_words = size / sizeof(uint32_t);
+    const bool submitted = ggml_vk_early_submit(ctx);
+    GGML_ASSERT(submitted);
+    return true;
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -16747,6 +17111,11 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    const int64_t gprof_t_begin = vk_graph_prof ? ggml_time_us() : 0;
+
+    if (!ctx->defer_submit && !ctx->deferred_ctxs.empty()) {
+        ggml_vk_flush_deferred(ctx);
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -16766,6 +17135,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // If the last op in the cgraph isn't backend GPU, the command buffer doesn't get closed properly
     while (last_node > 0 && (ggml_vk_is_empty(cgraph->nodes[last_node]) || ((cgraph->nodes[last_node]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0))) {
         last_node -= 1;
+    }
+
+    if (ctx->early_inflight) {
+        // early record: the previous window may still run, so its graph cleanup waits for the end of the
+        // graph; reset only what describes the recording (this window runs after the previous one, behind the gate)
+        ctx->tensor_ctxs.clear();
+        ctx->unsynced_nodes_written.clear();
+        ctx->unsynced_nodes_read.clear();
+        ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
+        ctx->prealloc_y_last_pipeline_used = {};
+        ctx->prealloc_y_last_tensor_used = nullptr;
+        ctx->prealloc_y_last_decode_vector_staging = false;
     }
 
     // Reserve tensor context space for all nodes
@@ -16811,11 +17192,37 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
 
-    if (ctx->prealloc_size_add_rms_partials) {
+    if (vk_graph_prof && !vk_perf_logger_enabled) {
+        if (!ctx->gprof_open) {
+            if (!ctx->gprof_pool) {
+                vk::QueryPoolCreateInfo qci;
+                qci.queryType = vk::QueryType::eTimestamp;
+                qci.queryCount = 2;
+                ctx->gprof_pool = ctx->device->device.createQueryPool(qci);
+            }
+            compute_ctx = ggml_vk_get_compute_ctx(ctx);
+            compute_ctx->s->buffer->buf.resetQueryPool(ctx->gprof_pool, 0, 2);
+            compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, ctx->gprof_pool, 0);
+            ctx->gprof_open = true;
+            ctx->gprof_t0 = gprof_t_begin;
+            ctx->gprof_rec = 0;
+            ctx->gprof_graphs = 0;
+            ctx->gprof_submits = 0;
+        }
+        ctx->gprof_graphs++;
+    }
+
+    if (ctx->prealloc_size_add_rms_partials && ctx->device->add_rms_fusion) {
         ggml_vk_preallocate_buffers(ctx, nullptr);
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         // initialize partial sums to zero.
-        ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        if (ctx->early_inflight) {
+            // on the GPU, behind this window's gate: the host memset (UMA) runs when this window is
+            // submitted, which is while the previous window may still use the partial sums
+            compute_ctx->s->buffer->buf.fillBuffer(ctx->prealloc_add_rms_partials->buffer, 0, ctx->prealloc_size_add_rms_partials, 0);
+        } else {
+            ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
+        }
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
@@ -17063,6 +17470,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
+        if (ctx->defer_submit) {
+            // the whole graph goes to the GPU at once (ggml_vk_flush_deferred), so one batch
+            submit = i + ctx->num_additional_fused_ops >= last_node;
+            almost_ready = false;
+        }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -17148,6 +17560,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    if (vk_graph_prof && ctx->gprof_open) {
+        ctx->gprof_rec += ggml_time_us() - gprof_t_begin;
     }
 
     if (!ctx->device->support_async) {
@@ -18465,11 +18881,77 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// "ggml_backend_vk_set_defer_submit": while set, graph_compute records without submitting.
+// Only for backends with async support and without GGML_VK_PERF_LOGGER (which waits per graph).
+// The recording goes to the GPU when deferring ends, behind the gate event.
+static void ggml_backend_vk_set_defer_submit(ggml_backend_t backend, bool defer) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    const bool was_deferring = ctx->defer_submit;
+    ctx->defer_submit = defer && ctx->device->support_async && !vk_perf_logger_enabled;
+    if (defer && ctx->defer_submit && !was_deferring && !ctx->compute_ctx.expired()) {
+        // work recorded into this already-open command buffer would not wait for the gate
+        static int warned = 0;
+        if (warned++ < 4) {
+            fprintf(stderr, "[vkgate] deferring with an open command buffer: its work is not held back\n");
+        }
+    }
+    if (was_deferring && !ctx->defer_submit && !ctx->deferred_ctxs.empty()) {
+        // every command buffer recorded while deferring starts with the gate wait, and recording it
+        // marked the gate pending (ggml_vk_get_compute_ctx), so the work can go to the GPU now
+        ggml_vk_flush_deferred(ctx, false);
+    }
+}
+
+// "ggml_backend_vk_early_submit" / "ggml_backend_vk_early_wait": early record, see ggml_vk_early_submit
+static bool ggml_backend_vk_early_submit(ggml_backend_t backend) {
+    return ggml_vk_early_submit((ggml_backend_vk_context *)backend->context);
+}
+
+static void ggml_backend_vk_early_wait(ggml_backend_t backend) {
+    ggml_vk_early_wait((ggml_backend_vk_context *)backend->context);
+}
+
+// "ggml_backend_vk_early_read": early record, see ggml_vk_early_read (tensor in this backend's device buffer)
+static bool ggml_backend_vk_early_read(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t size) {
+    if (tensor->buffer == nullptr || tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend)) {
+        return false;
+    }
+    return ggml_vk_early_read((ggml_backend_vk_context *)backend->context, tensor, data, size);
+}
+
+// "ggml_backend_vk_flush_deferred": let what was recorded while deferring run (set the gate event it
+// waits on).
+static void ggml_backend_vk_flush_deferred(ggml_backend_t backend) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_vk_flush_deferred(ctx);
+    ggml_vk_open_gate(ctx);
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_set_defer_submit") == 0) {
+        return (void *) ggml_backend_vk_set_defer_submit;
+    }
+    if (strcmp(name, "ggml_backend_vk_flush_deferred") == 0) {
+        return (void *) ggml_backend_vk_flush_deferred;
+    }
+    if (strcmp(name, "ggml_backend_vk_early_submit") == 0) {
+        return (void *) ggml_backend_vk_early_submit;
+    }
+    if (strcmp(name, "ggml_backend_vk_early_wait") == 0) {
+        return (void *) ggml_backend_vk_early_wait;
+    }
+    if (strcmp(name, "ggml_backend_vk_early_read") == 0) {
+        return (void *) ggml_backend_vk_early_read;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {

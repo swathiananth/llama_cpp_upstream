@@ -523,7 +523,10 @@ struct dist_comm_socket_context::impl {
     dist_nd_conn * nd_recv  = nullptr;   // inbound half, from prev
     bool           nd_shared = false;    // nd_send and nd_recv are the same object; free once
 
-    // Full-mesh all-reduce state, see exchange_mesh(). mesh_max_bytes 0 means the mesh is off.
+    // Full-mesh all-reduce state, see exchange_mesh(). mesh_max_bytes 0 means the mesh is off, else
+    // it is MESH_MAX_BYTES: a decode all-reduce is 16 KB, and a mesh payload has to stay inside one
+    // ND chunk (ND_PAYLOAD in dist-comm-nd.cpp, 256 KiB including the header).
+    static constexpr size_t MESH_MAX_BYTES = 64 * 1024;
     size_t               mesh_max_bytes    = 0;
     bool                 mesh_pending      = false;   // the first ring step ran as a mesh exchange
     size_t               mesh_pending_size = 0;
@@ -1112,19 +1115,7 @@ struct dist_comm_socket_context::impl {
 
     // select_allreduce() at world_size 4 with the diagonals up (establish_ring_mesh4).
     void select_allreduce_mesh4() {
-        constexpr size_t cap = 256 * 1024 - sizeof(op_hdr);
-        mesh_max_bytes = 64 * 1024;
-        const char * v = std::getenv("LLAMA_DIST_TP_MESH_MAX_BYTES");
-        if (v != nullptr && v[0] != '\0') {
-            try {
-                const long long n = std::stoll(v);
-                if (n > 0) {
-                    mesh_max_bytes = std::min((size_t) n, cap);
-                }
-            } catch (...) {
-                // keep the default
-            }
-        }
+        mesh_max_bytes = MESH_MAX_BYTES;
         mesh4 = true;
 
         const int next = (cfg.rank + 1) % 4;
@@ -1152,21 +1143,7 @@ struct dist_comm_socket_context::impl {
             return;
         }
 
-        // A decode collective is 16 KB. The cap keeps a mesh payload inside one ND chunk
-        // (ND_PAYLOAD in dist-comm-nd.cpp, 256 KiB including this header).
-        constexpr size_t cap = 256 * 1024 - sizeof(op_hdr);
-        mesh_max_bytes = 64 * 1024;
-        const char * v = std::getenv("LLAMA_DIST_TP_MESH_MAX_BYTES");
-        if (v != nullptr && v[0] != '\0') {
-            try {
-                const long long n = std::stoll(v);
-                if (n > 0) {
-                    mesh_max_bytes = std::min((size_t) n, cap);
-                }
-            } catch (...) {
-                // keep the default
-            }
-        }
+        mesh_max_bytes = MESH_MAX_BYTES;
 
         const int next = (cfg.rank + 1) % cfg.world_size;
         const int prev = (cfg.rank + cfg.world_size - 1) % cfg.world_size;

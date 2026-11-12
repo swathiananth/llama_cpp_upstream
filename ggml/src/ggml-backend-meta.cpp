@@ -1973,14 +1973,25 @@ static inline void ggml_meta_cpu_relax() { std::this_thread::yield(); }
 // that is held back (ggml_backend_vk_set_defer_submit). Once the reduced tensor is written back,
 // the held work is submitted (ggml_backend_vk_flush_deferred). Subgraph i has finished on the GPU
 // before the recording starts, so nothing the GPU uses changes under it, and the main thread does
-// not touch the Vulkan backend until the helper is done. LLAMA_DIST_TP_RECORD_AHEAD_SPIN_US
-// (default 2000): how long the helper polls for the next job before it sleeps.
+// not touch the Vulkan backend until the helper is done. The helper polls for the next job for
+// 2 ms before it sleeps.
 typedef void (*ggml_backend_vk_set_defer_submit_t)(ggml_backend_t backend, bool defer);
 typedef void (*ggml_backend_vk_flush_deferred_t)(ggml_backend_t backend);
+typedef bool (*ggml_backend_vk_early_submit_t)(ggml_backend_t backend);
+typedef void (*ggml_backend_vk_early_wait_t)(ggml_backend_t backend);
+typedef bool (*ggml_backend_vk_early_read_t)(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t size);
 
 struct ggml_meta_record_ahead {
     ggml_backend_vk_set_defer_submit_t set_defer = nullptr;
     ggml_backend_vk_flush_deferred_t   flush     = nullptr;
+    // Early record (older Vulkan builds: none): early_submit puts a window's copy-out on the GPU with the
+    // fence without waiting, the next subgraph is recorded while the GPU still runs it, early_wait then waits.
+    // The main thread then touches the backend while the helper records, through early_wait only.
+    ggml_backend_vk_early_submit_t     early_submit = nullptr;
+    ggml_backend_vk_early_wait_t       early_wait   = nullptr;
+    // early_read (newer Vulkan builds): records the boundary read and submits it like early_submit. A plain
+    // get_tensor_async into the unpinned host vector synchronizes by itself, so early_submit alone never applies.
+    ggml_backend_vk_early_read_t       early_read   = nullptr;
     int64_t                            spin_us   = 2000;
 
     std::thread             th;
@@ -2156,8 +2167,14 @@ struct ggml_backend_meta_context {
                 ahead.reset(new ggml_meta_record_ahead);
                 ahead->set_defer = set_defer;
                 ahead->flush     = flush;
-                if (const char * spin = getenv("LLAMA_DIST_TP_RECORD_AHEAD_SPIN_US")) {
-                    ahead->spin_us = atoll(spin);
+                ahead->early_submit = (ggml_backend_vk_early_submit_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_early_submit");
+                ahead->early_wait   = (ggml_backend_vk_early_wait_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_early_wait");
+                if (ahead->early_submit == nullptr || ahead->early_wait == nullptr) {
+                    ahead->early_submit = nullptr;
+                    ahead->early_wait   = nullptr;
+                }
+                if (ahead->early_wait != nullptr) {
+                    ahead->early_read = (ggml_backend_vk_early_read_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_early_read");
                 }
                 ggml_meta_record_ahead * a = ahead.get();
                 ahead->th = std::thread([a] { a->run(); });
@@ -2940,11 +2957,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 // replacing the previous full ggml_backend_synchronize + synchronous
                 // tensor_get (two fence waits per boundary).
                 const int64_t dp_g0 = distprof ? ggml_time_us() : 0;
+                bool early_read = false;
                 if (is_f32) {
                     if (nbytes_dst != n * sizeof(float)) {
                         continue;
                     }
-                    ggml_backend_tensor_get_async(bcj.backend, node_dst, cur.data(), 0, nbytes_dst);
+                    // early record: the read goes to the GPU with this window and the fence, without waiting
+                    early_read = ahead_next != nullptr && !ahead_posted && backend_ctx->ahead->early_read != nullptr &&
+                                 backend_ctx->ahead->early_read(bcj.backend, node_dst, cur.data(), nbytes_dst);
+                    if (!early_read) {
+                        ggml_backend_tensor_get_async(bcj.backend, node_dst, cur.data(), 0, nbytes_dst);
+                    }
                 } else {
                     cur_f16.resize(n);
                     if (nbytes_dst != n * sizeof(ggml_fp16_t)) {
@@ -2953,15 +2976,26 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_backend_tensor_get_async(bcj.backend, node_dst, cur_f16.data(), 0, nbytes_dst);
                 }
                 const int64_t dp_g1 = distprof ? ggml_time_us() : 0;
-                ggml_backend_synchronize(bcj.backend);
+                // early record: this window and its copy-out go to the GPU with the fence, and the next
+                // subgraph is recorded and submitted behind the gate while the GPU still runs this one
+                bool early = false;
+                if (early_read || (ahead_next != nullptr && !ahead_posted && backend_ctx->ahead->early_submit != nullptr &&
+                    backend_ctx->ahead->early_submit(bcj.backend))) {
+                    backend_ctx->ahead->post(bcj.backend, ahead_next);
+                    ahead_posted = true;
+                    early = true;
+                    backend_ctx->ahead->early_wait(bcj.backend);
+                } else {
+                    ggml_backend_synchronize(bcj.backend);
+                }
                 const int64_t dp_g2 = distprof ? ggml_time_us() : 0;
                 if (is_f16) {
                     ggml_fp16_to_fp32_row(cur_f16.data(), cur.data(), n);
                 }
                 if (distprof) { dp_t_get += dp_g1 - dp_g0; dp_t_sync += dp_g2 - dp_g1; dp_nbnd++; dp_bytes += n * sizeof(float); }
 
-                // the GPU is idle now: record the next subgraph while the network runs
-                bool ahead_wait = false;
+                // the GPU is idle now: record the next subgraph while the network runs (already posted early)
+                bool ahead_wait = early;
                 if (ahead_next != nullptr && !ahead_posted) {
                     backend_ctx->ahead->post(bcj.backend, ahead_next);
                     ahead_posted = true;

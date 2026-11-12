@@ -303,10 +303,6 @@ the network, and prints `dist-tp record-ahead on`.
 |---|---|
 | `GGML_VK_DISABLE_XE_MMVQ=1` | turn off the Q2_K/Q3_K decode matrix-vector kernel for Xe2/Xe3 |
 | `GGML_VK_DISABLE_FA_DEC_XE=1` | turn off the single-token Q8_0 flash-attention kernel for Xe2/Xe3, used for head size 128, Q8_0 K and V and 16 query heads per KV head (`-fa on -ctk q8_0 -ctv q8_0`) |
-| `GGML_VK_DEFER_GATE=1` | with `LLAMA_DIST_TP_RECORD_AHEAD=1`: the piece recorded ahead goes to the GPU as soon as it is recorded and waits there on an event the CPU sets once the all-reduced data is written back, instead of being submitted only at that point |
-| `GGML_VK_FENCE_POLL_PAUSES=N` | check the GPU fence every N CPU pause instructions while waiting (default 1000) |
-| `GGML_VK_EARLY_RECORD=2` | with `LLAMA_DIST_TP_RECORD_AHEAD=1` and `GGML_VK_DEFER_GATE=1`: at each all-reduce the read of its input goes to the GPU with the fence without waiting, and the next piece is recorded and submitted behind its gate while the GPU still runs this one. `2` polls the read-back data, `1` waits on the fence |
-| `GGML_VK_DONE_EVENT=1/2`, `GGML_VK_POLL_OUT=1`, `GGML_VK_KEEPALIVE=1` | experimental, off by default, not part of the settings above: return from a synchronize at an event in its own submit, or once the read-back data is seen in host memory, instead of at the fence; keep the GPU waiting on an event between record-ahead pieces instead of idle |
 | `GGML_VK_GRAPH_PROF=N` | diagnostic: every N synchronizes, print a `[vkgprof]` line with where the time from the first graph computed after a synchronize to the end of the next synchronize went (CPU recording before the GPU had work, GPU busy, GPU idle) |
 
 ## 7. Scripts
