@@ -2468,12 +2468,12 @@ bool common_dist_tp_apply_env_overrides(common_params & params, const common_dis
     params.fit_params = false;
     params.warmup = false;
     if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && env.world_size > 1) {
-        params.use_mmap = false;
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
     }
 
     std::fprintf(stderr,
-        "[dist-tp][rank=%d] split_mode=%d use_mmap=%s warmup=%s\n",
-        env.world_rank, (int) params.split_mode, params.use_mmap ? "true" : "false", params.warmup ? "true" : "false");
+        "[dist-tp][rank=%d] split_mode=%d load_mode=%s warmup=%s\n",
+        env.world_rank, (int) params.split_mode, llama_load_mode_name(params.load_mode), params.warmup ? "true" : "false");
 
     return true;
 }
